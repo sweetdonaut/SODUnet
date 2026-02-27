@@ -1,0 +1,17 @@
+# Data and datasets
+KolektorSDD2_patch/
+KolektorSDD2_raw/
+
+# Model checkpoints
+checkpoints*/
+runs/
+
+# Error analysis outputs
+error_analysis*/
+
+# Python
+__pycache__/
+*.pyc
+
+# Lock files
+uv.lock
