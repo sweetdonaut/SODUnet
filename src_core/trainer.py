@@ -3,7 +3,9 @@ from torch.utils.data import DataLoader
 from torch import optim
 import os
 import argparse
+import csv
 import numpy as np
+from datetime import datetime
 import cv2
 import glob
 import random
@@ -134,6 +136,13 @@ def train_on_device(args):
     weights_dir = os.path.join(output_dir, 'weights')
     os.makedirs(weights_dir, exist_ok=True)
 
+    # Initialize results CSV
+    csv_path = os.path.join(output_dir, 'results.csv')
+    csv_fields = ['epoch', 'avg_loss', 'lr', 'gamma', 'image_auroc', 'pixel_auroc']
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+    csv_writer.writeheader()
+
     # Set random seeds for reproducibility
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -197,6 +206,62 @@ def train_on_device(args):
 
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True, num_workers=7)
     print(f"Dataset size: {len(dataset)} samples per epoch")
+
+    # Count validation data
+    valid_images_dir = os.path.join(args.data_root, 'valid', 'images')
+    valid_labels_dir = os.path.join(args.data_root, 'valid', 'labels')
+    num_valid_images = 0
+    num_valid_patches = 0
+    if os.path.exists(valid_images_dir):
+        valid_paths = sorted(
+            glob.glob(os.path.join(valid_images_dir, "*.png"))
+            + glob.glob(os.path.join(valid_images_dir, "*.jpg"))
+            + glob.glob(os.path.join(valid_images_dir, "*.PNG"))
+            + glob.glob(os.path.join(valid_images_dir, "*.JPG"))
+            + glob.glob(os.path.join(valid_images_dir, "*.tiff"))
+            + glob.glob(os.path.join(valid_images_dir, "*.tif"))
+            + glob.glob(os.path.join(valid_images_dir, "*.TIFF"))
+            + glob.glob(os.path.join(valid_images_dir, "*.TIF"))
+        )
+        num_valid_images = len(valid_paths)
+        num_valid_patches = num_valid_images * dataset.patches_per_image
+
+    # Write training log
+    log_path = os.path.join(output_dir, 'training_log.txt')
+    with open(log_path, 'w') as f:
+        f.write(f"{'='*60}\n")
+        f.write(f"  SODUnet Training Log\n")
+        f.write(f"{'='*60}\n")
+        f.write(f"Date:             {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Task:             {args.task_name}\n\n")
+        f.write(f"--- Model ---\n")
+        f.write(f"Model file:       {args.model_file}\n")
+        f.write(f"Base channels:    {getattr(args, 'base_channels', 64)}\n")
+        f.write(f"Parameters:       {total_params:,} ({total_params/1e6:.2f}M)\n")
+        f.write(f"Dropout:          {getattr(args, 'dropout', 0.0)}\n")
+        f.write(f"ResBlock:         {getattr(args, 'use_resblock', False)}\n")
+        f.write(f"Encoder Attn:     {getattr(args, 'encoder_attention', False)}\n")
+        f.write(f"FPN:              {getattr(args, 'use_fpn', False)}\n\n")
+        f.write(f"--- Data ---\n")
+        f.write(f"Data root:        {args.data_root}\n")
+        f.write(f"Image size:       {dataset.img_h}x{dataset.img_w}\n")
+        f.write(f"Train images:     {len(dataset.image_paths)}\n")
+        f.write(f"Valid images:     {num_valid_images}\n")
+        f.write(f"Patch size:       {patch_size}x{patch_size}\n")
+        f.write(f"Patches/image:    {dataset.patches_per_image}\n")
+        f.write(f"Train patches:    {dataset.total_patches}\n")
+        f.write(f"Valid patches:    {num_valid_patches}\n")
+        f.write(f"In channels:      {args.in_channels}\n\n")
+        f.write(f"--- Training ---\n")
+        f.write(f"Batch size:       {args.bs}\n")
+        f.write(f"Learning rate:    {args.lr}\n")
+        f.write(f"Epochs:           {args.epochs}\n")
+        f.write(f"Eval interval:    {args.eval_interval}\n")
+        f.write(f"Gamma schedule:   [{args.gamma_start}, {args.gamma_end}] (cosine)\n")
+        f.write(f"Seed:             {args.seed}\n")
+        f.write(f"Device:           {device}\n")
+        f.write(f"{'='*60}\n")
+    print(f"Training log saved: {log_path}")
 
     num_batches = len(dataloader)
 
@@ -264,6 +329,17 @@ def train_on_device(args):
                 print(' - Validation data not found', end='')
         print()
 
+        # Log to CSV
+        csv_writer.writerow({
+            'epoch': epoch + 1,
+            'avg_loss': f'{avg_loss:.6e}',
+            'lr': f'{get_lr(optimizer):.6f}',
+            'gamma': f'{current_gamma:.3f}',
+            'image_auroc': f'{image_auroc:.4f}' if image_auroc is not None else '',
+            'pixel_auroc': f'{pixel_auroc:.4f}' if pixel_auroc is not None else '',
+        })
+        csv_file.flush()
+
         # Build checkpoint dict
         checkpoint = {
             'model_state_dict': model_seg.state_dict(),
@@ -286,7 +362,9 @@ def train_on_device(args):
             torch.save(checkpoint, os.path.join(weights_dir, 'best.pth'))
             print(f'  >> New best model saved (Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch})')
 
+    csv_file.close()
     print(f'\nTraining complete. Best Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch}')
+    print(f'Results saved to: {csv_path}')
 
 def main():
     parser = argparse.ArgumentParser()
@@ -308,8 +386,8 @@ def main():
                         help='Starting gamma value for focal loss (default: 1.0)')
     parser.add_argument('--gamma_end', type=float, default=3.0,
                         help='Ending gamma value for focal loss (default: 3.0)')
-    parser.add_argument('--eval_interval', type=int, default=10,
-                        help='Evaluate every N epochs (default: 10)')
+    parser.add_argument('--eval_interval', type=int, default=1,
+                        help='Evaluate every N epochs (default: 1)')
     parser.add_argument('--model_file', type=str, default='model_v1',
                         help='Model module: model_v1, model_v2, model_v3, model_v4 (default: model_v1)')
     parser.add_argument('--base_channels', type=int, default=64,
