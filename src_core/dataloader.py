@@ -57,6 +57,10 @@ class DefectDataset(Dataset):
             + glob(os.path.join(images_dir, "*.jpg"))
             + glob(os.path.join(images_dir, "*.PNG"))
             + glob(os.path.join(images_dir, "*.JPG"))
+            + glob(os.path.join(images_dir, "*.tiff"))
+            + glob(os.path.join(images_dir, "*.tif"))
+            + glob(os.path.join(images_dir, "*.TIFF"))
+            + glob(os.path.join(images_dir, "*.TIF"))
         )
         if not self.image_paths:
             raise ValueError(f"No images found in {images_dir}")

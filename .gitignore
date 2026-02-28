@@ -2,9 +2,13 @@
 KolektorSDD2_patch/
 KolektorSDD2_raw/
 
-# Model checkpoints
+# Model checkpoints and outputs
 checkpoints*/
+outputs/
 runs/
+
+# Synthetic data
+synthetic_data/
 
 # Error analysis outputs
 error_analysis*/

@@ -6,10 +6,11 @@ import cv2
 import os
 import argparse
 import glob
+import csv
+import importlib
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from model import SegmentationNetwork
 from dataloader import calculate_positions, yolo_label_to_mask
 
 
@@ -21,6 +22,10 @@ class InferenceDataset(Dataset):
             + glob.glob(os.path.join(images_dir, "*.jpg"))
             + glob.glob(os.path.join(images_dir, "*.PNG"))
             + glob.glob(os.path.join(images_dir, "*.JPG"))
+            + glob.glob(os.path.join(images_dir, "*.tiff"))
+            + glob.glob(os.path.join(images_dir, "*.tif"))
+            + glob.glob(os.path.join(images_dir, "*.TIFF"))
+            + glob.glob(os.path.join(images_dir, "*.TIF"))
         )
         print(f"Found {len(self.image_paths)} test images")
 
@@ -154,9 +159,95 @@ def visualize_results(image, heatmap, output_path, gt_mask=None):
     plt.close()
 
 
+def extract_spots(heatmap, threshold=0.1):
+    """Extract bright spots from heatmap via connected components.
+    Returns list of (x, y, score) sorted by score descending.
+    """
+    binary = (heatmap > threshold).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    spots = []
+    for label_id in range(1, num_labels):  # skip background
+        component_mask = (labels == label_id)
+        masked_scores = heatmap * component_mask
+        peak_idx = np.unravel_index(masked_scores.argmax(), masked_scores.shape)
+        peak_y, peak_x = peak_idx
+        peak_score = float(heatmap[peak_y, peak_x])
+        spots.append((peak_x, peak_y, peak_score))
+    spots.sort(key=lambda s: s[2], reverse=True)
+    return spots
+
+
+def load_defect_csv(csv_path):
+    """Load test defect CSV. Returns dict: filename -> list of (rawx, rawy, dsnr)."""
+    gt = {}
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fn = row['filename']
+            gt.setdefault(fn, []).append((
+                int(row['rawx']), int(row['rawy']), float(row['dsnr'])
+            ))
+    return gt
+
+
+def plot_review_efficiency(all_spots, gt_defects, total_defects, output_path):
+    """Plot review efficiency: x=review count (sorted by score desc), y=captured defects.
+
+    all_spots: list of (filename, x, y, score) already sorted by score descending.
+    gt_defects: dict filename -> list of (rawx, rawy, dsnr).
+    """
+    captured = {fn: [False] * len(defs) for fn, defs in gt_defects.items()}
+    review_counts = []
+    defect_counts = []
+    cum_defects = 0
+
+    for i, (fn, sx, sy, score) in enumerate(all_spots):
+        if fn in captured:
+            for j, (gx, gy, _dsnr) in enumerate(gt_defects[fn]):
+                if not captured[fn][j] and abs(sx - gx) < 15 and abs(sy - gy) < 15:
+                    captured[fn][j] = True
+                    cum_defects += 1
+                    break
+        review_counts.append(i + 1)
+        defect_counts.append(cum_defects)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+    ax.plot(review_counts, defect_counts, 'b-', linewidth=2)
+    ax.set_xlabel('Review Count (spots sorted by score, high→low)')
+    ax.set_ylabel('Captured Defect Count')
+    ax.set_title('Review Efficiency')
+    ax.axhline(y=total_defects, color='r', linestyle='--', alpha=0.7,
+               label=f'Total defects: {total_defects}')
+    if len(review_counts) > 0:
+        ax.set_xlim(0, review_counts[-1])
+    ax.set_ylim(0, total_defects + 1)
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"Review efficiency plot saved: {output_path}")
+    print(f"  Total spots: {len(all_spots)}, "
+          f"Captured: {cum_defects}/{total_defects} defects")
+    if len(review_counts) > 0 and cum_defects == total_defects:
+        # Find at which review count all defects were captured
+        for rc, dc in zip(review_counts, defect_counts):
+            if dc == total_defects:
+                print(f"  All defects captured at review #{rc}")
+                break
+
+
 def inference(args):
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    output_dir = os.path.join('..', 'outputs', args.task_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Default model_path to weights/best.pth in task dir
+    if args.model_path is None:
+        args.model_path = os.path.join(output_dir, 'weights', 'best.pth')
 
     if torch.cuda.is_available() and args.gpu_id >= 0:
         device = torch.device(f'cuda:{args.gpu_id}')
@@ -172,7 +263,10 @@ def inference(args):
     in_channels = checkpoint.get('in_channels', 1)
     print(f"Model patch size: {patch_size}, in_channels: {in_channels}")
 
-    model = SegmentationNetwork(in_channels=in_channels, out_channels=2)
+    model_module = importlib.import_module(args.model_file)
+    SegmentationNetwork = model_module.SegmentationNetwork
+    base_channels = args.base_channels
+    model = SegmentationNetwork(in_channels=in_channels, out_channels=2, base_channels=base_channels)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
@@ -184,6 +278,7 @@ def inference(args):
     all_labels = []
     pixel_scores = []
     pixel_labels = []
+    all_spots = []  # (filename, x, y, score) across all images
 
     for i, sample in enumerate(dataloader):
         image = sample['image'].squeeze().numpy()
@@ -193,6 +288,7 @@ def inference(args):
         heatmap, processed_image = sliding_window_inference(
             image, model, patch_size, in_channels, device
         )
+        print(f"\r  Processing [{i+1}/{len(dataloader)}] {os.path.basename(img_path)}", end='', flush=True)
 
         # Load GT mask if labels_dir provided
         gt_mask = None
@@ -200,12 +296,6 @@ def inference(args):
             basename = os.path.splitext(os.path.basename(img_path))[0]
             label_path = os.path.join(args.labels_dir, basename + '.txt')
             gt_mask = yolo_label_to_mask(label_path, h, w)
-
-        filename = os.path.basename(img_path).split('.')[0]
-        output_path = os.path.join(args.output_dir, f'{filename}_result.png')
-
-        visualize_results(processed_image, heatmap, output_path, gt_mask=gt_mask)
-        print(f"Saved result: {output_path}")
 
         if gt_mask is not None:
             max_score = heatmap.max()
@@ -217,6 +307,15 @@ def inference(args):
 
             pixel_scores.extend(heatmap.flatten())
             pixel_labels.extend(gt_binary.flatten())
+
+        # Extract spots for review efficiency
+        if args.csv_path:
+            img_filename = os.path.basename(img_path)
+            spots = extract_spots(heatmap, threshold=args.threshold)
+            for sx, sy, sc in spots:
+                all_spots.append((img_filename, sx, sy, sc))
+
+    print()
 
     if args.labels_dir and len(all_scores) > 0:
         if len(np.unique(all_labels)) > 1:
@@ -231,22 +330,38 @@ def inference(args):
         else:
             print("Pixel-level AUROC: Cannot calculate (only one class present)")
 
-    print(f"\nInference completed. Results saved to: {args.output_dir}")
+    # Review efficiency analysis
+    if args.csv_path:
+        gt_defects = load_defect_csv(args.csv_path)
+        total_defects = sum(len(v) for v in gt_defects.values())
+        all_spots.sort(key=lambda s: s[3], reverse=True)
+        efficiency_path = os.path.join(output_dir, 'review_efficiency.png')
+        plot_review_efficiency(all_spots, gt_defects, total_defects, efficiency_path)
+
+    print(f"\nInference completed. Results saved to: {output_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Inference for SODUnet')
 
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to trained model checkpoint (.pth file)')
+    parser.add_argument('--task_name', type=str, required=True,
+                        help='Task name (outputs saved to ../outputs/<task_name>/)')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to checkpoint (default: ../outputs/<task_name>/best.pth)')
     parser.add_argument('--images_dir', type=str, required=True,
                         help='Path to test images directory')
     parser.add_argument('--labels_dir', type=str, default=None,
                         help='Path to YOLO labels directory for GT (optional)')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Directory to save output visualizations')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU ID to use. Set to -1 for CPU (default: 0)')
+    parser.add_argument('--model_file', type=str, default='model',
+                        help='Model module: model, model_v2, model_v3, model_v4 (default: model)')
+    parser.add_argument('--base_channels', type=int, default=64,
+                        help='Base channel width (default: 64)')
+    parser.add_argument('--csv_path', type=str, default=None,
+                        help='Path to test_defects.csv for review efficiency analysis')
+    parser.add_argument('--threshold', type=float, default=0.1,
+                        help='Heatmap threshold for spot extraction (default: 0.1)')
 
     args = parser.parse_args()
 

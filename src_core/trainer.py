@@ -53,6 +53,10 @@ def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, devic
         + glob.glob(os.path.join(images_dir, "*.jpg"))
         + glob.glob(os.path.join(images_dir, "*.PNG"))
         + glob.glob(os.path.join(images_dir, "*.JPG"))
+        + glob.glob(os.path.join(images_dir, "*.tiff"))
+        + glob.glob(os.path.join(images_dir, "*.tif"))
+        + glob.glob(os.path.join(images_dir, "*.TIFF"))
+        + glob.glob(os.path.join(images_dir, "*.TIF"))
     )
 
     with torch.no_grad():
@@ -126,8 +130,9 @@ def weights_init(m):
 
 
 def train_on_device(args):
-    if not os.path.exists(args.checkpoint_path):
-        os.makedirs(args.checkpoint_path)
+    output_dir = os.path.join('..', 'outputs', args.task_name)
+    weights_dir = os.path.join(output_dir, 'weights')
+    os.makedirs(weights_dir, exist_ok=True)
 
     # Set random seeds for reproducibility
     if args.seed is not None:
@@ -272,13 +277,13 @@ def train_on_device(args):
         }
 
         # Always save last model
-        torch.save(checkpoint, os.path.join(args.checkpoint_path, f'{run_name}_last.pth'))
+        torch.save(checkpoint, os.path.join(weights_dir, 'last.pth'))
 
         # Save best model (by pixel AUROC)
         if pixel_auroc is not None and pixel_auroc > best_pixel_auroc:
             best_pixel_auroc = pixel_auroc
             best_epoch = epoch + 1
-            torch.save(checkpoint, os.path.join(args.checkpoint_path, f'{run_name}_best.pth'))
+            torch.save(checkpoint, os.path.join(weights_dir, 'best.pth'))
             print(f'  >> New best model saved (Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch})')
 
     print(f'\nTraining complete. Best Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch}')
@@ -290,7 +295,8 @@ def main():
     parser.add_argument('--epochs', action='store', type=int, required=True, help='Number of epochs')
     parser.add_argument('--gpu_id', action='store', type=int, default=0,
                         help='GPU ID to use. Set to -1 to use CPU')
-    parser.add_argument('--checkpoint_path', action='store', type=str, required=True, help='Path to save checkpoints')
+    parser.add_argument('--task_name', type=str, required=True,
+                        help='Task name (outputs saved to ../outputs/<task_name>/)')
     parser.add_argument('--patch_size', type=int, default=128, help='Patch size for training (default: 128)')
     parser.add_argument('--data_root', action='store', type=str, required=True,
                         help='Dataset root directory (contains train/ and valid/)')
