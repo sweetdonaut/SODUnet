@@ -192,20 +192,39 @@ def load_defect_csv(csv_path):
     return gt
 
 
-def plot_review_efficiency(all_spots, gt_defects, total_defects, output_path):
+def plot_review_efficiency(all_spots, gt_defects, output_path, title='Review Efficiency',
+                           dsnr_filter=None):
     """Plot review efficiency: x=review count (sorted by score desc), y=captured defects.
 
     all_spots: list of (filename, x, y, score) already sorted by score descending.
     gt_defects: dict filename -> list of (rawx, rawy, dsnr).
+    dsnr_filter: None=all, 'low'=dsnr<3.5, 'high'=dsnr>=3.5.
     """
-    captured = {fn: [False] * len(defs) for fn, defs in gt_defects.items()}
+    # Filter GT defects by DSNR
+    if dsnr_filter == 'low':
+        filtered_gt = {fn: [(x, y, d) for x, y, d in defs if d < 3.5]
+                       for fn, defs in gt_defects.items()}
+    elif dsnr_filter == 'high':
+        filtered_gt = {fn: [(x, y, d) for x, y, d in defs if d >= 3.5]
+                       for fn, defs in gt_defects.items()}
+    else:
+        filtered_gt = gt_defects
+    # Remove empty entries
+    filtered_gt = {fn: defs for fn, defs in filtered_gt.items() if len(defs) > 0}
+    total_defects = sum(len(v) for v in filtered_gt.values())
+
+    if total_defects == 0:
+        print(f"  {title}: no defects in this group, skipping")
+        return
+
+    captured = {fn: [False] * len(defs) for fn, defs in filtered_gt.items()}
     review_counts = []
     defect_counts = []
     cum_defects = 0
 
     for i, (fn, sx, sy, score) in enumerate(all_spots):
         if fn in captured:
-            for j, (gx, gy, _dsnr) in enumerate(gt_defects[fn]):
+            for j, (gx, gy, _dsnr) in enumerate(filtered_gt[fn]):
                 if not captured[fn][j] and abs(sx - gx) < 15 and abs(sy - gy) < 15:
                     captured[fn][j] = True
                     cum_defects += 1
@@ -213,12 +232,14 @@ def plot_review_efficiency(all_spots, gt_defects, total_defects, output_path):
         review_counts.append(i + 1)
         defect_counts.append(cum_defects)
 
-    # Plot
+    # Plot (prepend origin so curve starts at (0, 0))
+    review_counts = [0] + review_counts
+    defect_counts = [0] + defect_counts
     fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
     ax.plot(review_counts, defect_counts, 'b-', linewidth=2)
     ax.set_xlabel('Review Count (spots sorted by score, high→low)')
     ax.set_ylabel('Captured Defect Count')
-    ax.set_title('Review Efficiency')
+    ax.set_title(title)
     ax.axhline(y=total_defects, color='r', linestyle='--', alpha=0.7,
                label=f'Total defects: {total_defects}')
     if len(review_counts) > 0:
@@ -230,15 +251,8 @@ def plot_review_efficiency(all_spots, gt_defects, total_defects, output_path):
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"Review efficiency plot saved: {output_path}")
-    print(f"  Total spots: {len(all_spots)}, "
-          f"Captured: {cum_defects}/{total_defects} defects")
-    if len(review_counts) > 0 and cum_defects == total_defects:
-        # Find at which review count all defects were captured
-        for rc, dc in zip(review_counts, defect_counts):
-            if dc == total_defects:
-                print(f"  All defects captured at review #{rc}")
-                break
+    print(f"  {title}: {cum_defects}/{total_defects} defects captured, "
+          f"{len(all_spots)} spots -> {output_path}")
 
 
 def inference(args):
@@ -276,8 +290,7 @@ def inference(args):
 
     all_scores = []
     all_labels = []
-    pixel_scores = []
-    pixel_labels = []
+    pixel_aurocs = []
     all_spots = []  # (filename, x, y, score) across all images
 
     for i, sample in enumerate(dataloader):
@@ -305,8 +318,10 @@ def inference(args):
             all_scores.append(max_score)
             all_labels.append(has_anomaly)
 
-            pixel_scores.extend(heatmap.flatten())
-            pixel_labels.extend(gt_binary.flatten())
+            # Per-image pixel AUROC (avoids OOM from accumulating all pixels)
+            if len(np.unique(gt_binary)) > 1:
+                pa = roc_auc_score(gt_binary.flatten(), heatmap.flatten())
+                pixel_aurocs.append(pa)
 
         # Extract spots for review efficiency
         if args.csv_path:
@@ -324,19 +339,29 @@ def inference(args):
         else:
             print("\nImage-level AUROC: Cannot calculate (only one class present)")
 
-        if len(np.unique(pixel_labels)) > 1:
-            pixel_auroc = roc_auc_score(pixel_labels, pixel_scores)
-            print(f"Pixel-level AUROC: {pixel_auroc:.4f}")
+        if len(pixel_aurocs) > 0:
+            mean_pixel_auroc = np.mean(pixel_aurocs)
+            print(f"Pixel-level AUROC (mean per-image): {mean_pixel_auroc:.4f} "
+                  f"({len(pixel_aurocs)} images with defects)")
         else:
-            print("Pixel-level AUROC: Cannot calculate (only one class present)")
+            print("Pixel-level AUROC: Cannot calculate (no images with both classes)")
 
     # Review efficiency analysis
     if args.csv_path:
         gt_defects = load_defect_csv(args.csv_path)
-        total_defects = sum(len(v) for v in gt_defects.values())
         all_spots.sort(key=lambda s: s[3], reverse=True)
-        efficiency_path = os.path.join(output_dir, 'review_efficiency.png')
-        plot_review_efficiency(all_spots, gt_defects, total_defects, efficiency_path)
+        print("Review efficiency:")
+        plot_review_efficiency(all_spots, gt_defects,
+                               os.path.join(output_dir, 'review_efficiency_all.png'),
+                               title='Review Efficiency (All)')
+        plot_review_efficiency(all_spots, gt_defects,
+                               os.path.join(output_dir, 'review_efficiency_dsnr_low.png'),
+                               title='Review Efficiency (DSNR < 3.5)',
+                               dsnr_filter='low')
+        plot_review_efficiency(all_spots, gt_defects,
+                               os.path.join(output_dir, 'review_efficiency_dsnr_high.png'),
+                               title='Review Efficiency (DSNR >= 3.5)',
+                               dsnr_filter='high')
 
     print(f"\nInference completed. Results saved to: {output_dir}")
 
