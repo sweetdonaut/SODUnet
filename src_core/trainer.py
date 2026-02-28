@@ -9,7 +9,8 @@ import glob
 import random
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
-from model import SegmentationNetwork
+import importlib
+import inspect
 from dataloader import DefectDataset, calculate_positions, yolo_label_to_mask
 
 def get_lr(optimizer):
@@ -151,7 +152,22 @@ def train_on_device(args):
     run_name = f'SODUnet_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size}x{patch_size}'
 
     # Segmentation network
-    model_seg = SegmentationNetwork(in_channels=args.in_channels, out_channels=2)
+    model_module = importlib.import_module(args.model_file)
+    SegmentationNetwork = model_module.SegmentationNetwork
+    model_kwargs = dict(
+        in_channels=args.in_channels,
+        out_channels=2,
+        base_channels=getattr(args, 'base_channels', 64),
+        dropout=getattr(args, 'dropout', 0.0),
+        use_resblock=getattr(args, 'use_resblock', False),
+        encoder_attention=getattr(args, 'encoder_attention', False),
+        use_fpn=getattr(args, 'use_fpn', False),
+    )
+    sig = inspect.signature(SegmentationNetwork.__init__)
+    valid_kwargs = {k: v for k, v in model_kwargs.items() if k in sig.parameters}
+    model_seg = SegmentationNetwork(**valid_kwargs)
+    total_params = sum(p.numel() for p in model_seg.parameters())
+    print(f"Model params: {total_params:,} ({total_params/1e6:.2f}M)")
     model_seg.to(device)
     model_seg.apply(weights_init)
 
@@ -194,11 +210,19 @@ def train_on_device(args):
             target_mask = sample_batched["mask"].to(device)
 
             # Forward pass through segmentation network
-            out_mask = model_seg(input_image)
-            out_mask_sm = torch.softmax(out_mask, dim=1)
+            output = model_seg(input_image)
 
-            # Calculate loss
-            loss = criterion(out_mask_sm, target_mask)
+            # Handle deep supervision (model returns tuple) or single output
+            if isinstance(output, tuple):
+                out_mask, aux_d3, aux_d2 = output
+                out_mask_sm = torch.softmax(out_mask, dim=1)
+                loss_main = criterion(out_mask_sm, target_mask)
+                loss_aux_d3 = criterion(torch.softmax(aux_d3, dim=1), target_mask)
+                loss_aux_d2 = criterion(torch.softmax(aux_d2, dim=1), target_mask)
+                loss = loss_main + 0.4 * loss_aux_d3 + 0.4 * loss_aux_d2
+            else:
+                out_mask_sm = torch.softmax(output, dim=1)
+                loss = criterion(out_mask_sm, target_mask)
 
             optimizer.zero_grad()
             loss.backward()
@@ -280,7 +304,18 @@ def main():
                         help='Ending gamma value for focal loss (default: 3.0)')
     parser.add_argument('--eval_interval', type=int, default=10,
                         help='Evaluate every N epochs (default: 10)')
-
+    parser.add_argument('--model_file', type=str, default='model',
+                        help='Model module to import: model (v1), model_v2, model_v3, model_v4 (default: model)')
+    parser.add_argument('--base_channels', type=int, default=64,
+                        help='Base channel width for UNet encoder (default: 64)')
+    parser.add_argument('--dropout', type=float, default=0.0,
+                        help='Dropout2d rate in decoder (default: 0.0)')
+    parser.add_argument('--use_resblock', action='store_true',
+                        help='Use residual blocks in encoder')
+    parser.add_argument('--encoder_attention', action='store_true',
+                        help='Add CoordAttention on encoder outputs')
+    parser.add_argument('--use_fpn', action='store_true',
+                        help='Add FPN bridge between encoder and decoder')
 
     args = parser.parse_args()
 
