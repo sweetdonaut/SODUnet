@@ -192,6 +192,101 @@ def load_defect_csv(csv_path):
     return gt
 
 
+def plot_froc_curve(all_spots, gt_defects, num_images, output_path,
+                    title='FROC Curve', dsnr_filter=None, match_tol=15):
+    """Plot FROC curve: x=avg FP per image, y=sensitivity.
+
+    all_spots: list of (filename, x, y, score) already sorted by score descending.
+    gt_defects: dict filename -> list of (rawx, rawy, dsnr).
+    """
+    # Filter GT defects by DSNR
+    if dsnr_filter == 'low':
+        filtered_gt = {fn: [(x, y, d) for x, y, d in defs if d < 3.5]
+                       for fn, defs in gt_defects.items()}
+    elif dsnr_filter == 'high':
+        filtered_gt = {fn: [(x, y, d) for x, y, d in defs if d >= 3.5]
+                       for fn, defs in gt_defects.items()}
+    else:
+        filtered_gt = gt_defects
+    filtered_gt = {fn: defs for fn, defs in filtered_gt.items() if len(defs) > 0}
+    total_defects = sum(len(v) for v in filtered_gt.values())
+
+    if total_defects == 0:
+        print(f"  {title}: no defects in this group, skipping")
+        return
+
+    captured = {fn: [False] * len(defs) for fn, defs in filtered_gt.items()}
+    sensitivities = [0.0]
+    fp_per_image = [0.0]
+    matched_count = 0
+    fp_count = 0
+    matched_distances = []
+    reached_1fp = False
+
+    for fn, sx, sy, score in all_spots:
+        is_match = False
+        if fn in captured:
+            best_j = -1
+            best_dist = float('inf')
+            for j, (gx, gy, _dsnr) in enumerate(filtered_gt[fn]):
+                if not captured[fn][j] and abs(sx - gx) < match_tol and abs(sy - gy) < match_tol:
+                    dist = np.sqrt((sx - gx)**2 + (sy - gy)**2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_j = j
+            if best_j >= 0:
+                captured[fn][best_j] = True
+                matched_count += 1
+                if not reached_1fp:
+                    matched_distances.append(best_dist)
+                is_match = True
+
+        if not is_match:
+            fp_count += 1
+
+        sensitivities.append(matched_count / total_defects)
+        fp_per_image.append(fp_count / num_images)
+
+        if not reached_1fp and fp_count / num_images >= 1.0:
+            reached_1fp = True
+
+    # Find recall at 1 FP/image
+    recall_at_1fp = 0.0
+    for k in range(1, len(fp_per_image)):
+        if fp_per_image[k] >= 1.0:
+            fp_prev, fp_curr = fp_per_image[k-1], fp_per_image[k]
+            s_prev, s_curr = sensitivities[k-1], sensitivities[k]
+            t = (1.0 - fp_prev) / (fp_curr - fp_prev) if fp_curr > fp_prev else 0
+            recall_at_1fp = s_prev + t * (s_curr - s_prev)
+            break
+    else:
+        recall_at_1fp = sensitivities[-1] if sensitivities else 0.0
+
+    # Mean localization error
+    mean_loc = np.mean(matched_distances) if matched_distances else float('nan')
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+    ax.plot(fp_per_image, sensitivities, 'b-', linewidth=2)
+    ax.axvline(x=1.0, color='gray', linestyle=':', alpha=0.5, label='1 FP/image')
+    ax.plot(1.0, recall_at_1fp, 'ro', markersize=8,
+            label=f'Recall@1FP: {recall_at_1fp:.3f}')
+    ax.set_xlabel('Average FP per Image')
+    ax.set_ylabel('Sensitivity (Recall)')
+    ax.set_title(title)
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    loc_str = f'{mean_loc:.1f}px' if not np.isnan(mean_loc) else 'N/A'
+    print(f"  {title}: Recall@1FP={recall_at_1fp:.4f}, "
+          f"LocError={loc_str}, "
+          f"{matched_count}/{total_defects} defects -> {output_path}")
+
+
 def plot_review_efficiency(all_spots, gt_defects, output_path, title='Review Efficiency',
                            dsnr_filter=None):
     """Plot review efficiency: x=review count (sorted by score desc), y=captured defects.
@@ -346,10 +441,25 @@ def inference(args):
         else:
             print("Pixel-level AUROC: Cannot calculate (no images with both classes)")
 
-    # Review efficiency analysis
+    # Review efficiency and FROC analysis
     if args.csv_path:
         gt_defects = load_defect_csv(args.csv_path)
+        num_test_images = len(dataloader)
         all_spots.sort(key=lambda s: s[3], reverse=True)
+
+        print("FROC curves:")
+        plot_froc_curve(all_spots, gt_defects, num_test_images,
+                        os.path.join(output_dir, 'froc_all.png'),
+                        title='FROC Curve (All)')
+        plot_froc_curve(all_spots, gt_defects, num_test_images,
+                        os.path.join(output_dir, 'froc_dsnr_low.png'),
+                        title='FROC Curve (DSNR < 3.5)',
+                        dsnr_filter='low')
+        plot_froc_curve(all_spots, gt_defects, num_test_images,
+                        os.path.join(output_dir, 'froc_dsnr_high.png'),
+                        title='FROC Curve (DSNR >= 3.5)',
+                        dsnr_filter='high')
+
         print("Review efficiency:")
         plot_review_efficiency(all_spots, gt_defects,
                                os.path.join(output_dir, 'review_efficiency_all.png'),

@@ -25,6 +25,25 @@ def yolo_label_to_mask(label_path, img_h, img_w):
     return mask
 
 
+def yolo_label_to_centroids(label_path, img_h, img_w):
+    """Return list of (cx, cy) pixel coordinates from YOLO polygon label."""
+    centroids = []
+    if not os.path.exists(label_path):
+        return centroids
+    with open(label_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 7:
+                continue
+            coords = list(map(float, parts[1:]))
+            pts = np.array(coords).reshape(-1, 2)
+            pts[:, 0] *= img_w
+            pts[:, 1] *= img_h
+            cx, cy = np.mean(pts, axis=0)
+            centroids.append((cx, cy))
+    return centroids
+
+
 def calculate_positions(img_size, patch_size, min_patches=2):
     """Calculate patch positions with minimum overlap, maximum coverage."""
     max_start = img_size - patch_size

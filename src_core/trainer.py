@@ -9,11 +9,11 @@ from datetime import datetime
 import cv2
 import glob
 import random
-from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 import importlib
 import inspect
-from dataloader import DefectDataset, calculate_positions, yolo_label_to_mask
+from dataloader import DefectDataset, calculate_positions, yolo_label_to_centroids
+from inference import extract_spots
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
@@ -41,14 +41,13 @@ def get_focal_gamma(epoch, total_epochs, gamma_start, gamma_end, schedule='cosin
         raise ValueError(f"Unknown schedule: {schedule}")
     return gamma
 
-def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, device):
-    """Evaluate model on validation set using sliding window."""
-    model.eval()
+def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, device,
+                   match_tol=15, spot_threshold=0.05):
+    """Evaluate model on validation set using FROC metrics.
 
-    all_scores = []
-    all_labels = []
-    pixel_scores = []
-    pixel_labels = []
+    Returns (recall_at_1fp, mean_loc_error).
+    """
+    model.eval()
 
     image_paths = sorted(
         glob.glob(os.path.join(images_dir, "*.png"))
@@ -60,6 +59,10 @@ def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, devic
         + glob.glob(os.path.join(images_dir, "*.TIFF"))
         + glob.glob(os.path.join(images_dir, "*.TIF"))
     )
+
+    all_spots = []   # (x, y, score) across all images
+    all_gt = []       # (x, y) across all images
+    num_images = 0
 
     with torch.no_grad():
         for img_path in image_paths:
@@ -99,28 +102,82 @@ def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, devic
                     full_score_map[y:y+patch_size, x:x+patch_size] += patch_score
                     count_map[y:y+patch_size, x:x+patch_size] += 1
 
-            anomaly_score_map = full_score_map / np.maximum(count_map, 1)
-            max_score = anomaly_score_map.max()
+            heatmap = full_score_map / np.maximum(count_map, 1)
+            num_images += 1
 
-            # Load ground truth mask from YOLO label
+            # Extract predicted spots
+            spots = extract_spots(heatmap, threshold=spot_threshold)
+            all_spots.extend(spots)
+
+            # Load GT centroids from YOLO label
             basename = os.path.splitext(os.path.basename(img_path))[0]
             label_path = os.path.join(labels_dir, basename + ".txt")
-            gt_mask = yolo_label_to_mask(label_path, h, w).astype(np.float32) / 255.0
+            gt_centroids = yolo_label_to_centroids(label_path, h, w)
+            all_gt.extend(gt_centroids)
 
-            has_anomaly = 1.0 if np.sum(gt_mask) > 0 else 0.0
-            all_scores.append(max_score)
-            all_labels.append(has_anomaly)
+    # Compute FROC metrics
+    total_gt = len(all_gt)
+    recall_at_1fp = 0.0
+    mean_loc_error = float('nan')
 
-            pixel_scores.extend(anomaly_score_map.flatten())
-            pixel_labels.extend(gt_mask.flatten())
+    if total_gt > 0 and len(all_spots) > 0:
+        # Sort spots by score descending
+        all_spots.sort(key=lambda s: s[2], reverse=True)
 
-    # Calculate AUROC
-    image_auroc = roc_auc_score(all_labels, all_scores) if len(np.unique(all_labels)) > 1 else 0.0
-    pixel_auroc = roc_auc_score(pixel_labels, pixel_scores) if len(np.unique(pixel_labels)) > 1 else 0.0
+        gt_matched = [False] * total_gt
+        matched_distances = []
+        sensitivities = []
+        fp_per_image = []
+        matched_count = 0
+        fp_count = 0
+        reached_1fp = False
+
+        for sx, sy, score in all_spots:
+            best_j = -1
+            best_dist = float('inf')
+            for j, (gx, gy) in enumerate(all_gt):
+                if not gt_matched[j] and abs(sx - gx) < match_tol and abs(sy - gy) < match_tol:
+                    dist = np.sqrt((sx - gx)**2 + (sy - gy)**2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_j = j
+
+            if best_j >= 0:
+                gt_matched[best_j] = True
+                matched_count += 1
+                if not reached_1fp:
+                    matched_distances.append(best_dist)
+            else:
+                fp_count += 1
+
+            sensitivities.append(matched_count / total_gt)
+            fp_per_image.append(fp_count / num_images)
+
+            if not reached_1fp and fp_count / num_images >= 1.0:
+                reached_1fp = True
+
+        # Interpolate recall at 1 FP/image
+        for k in range(len(fp_per_image)):
+            if fp_per_image[k] >= 1.0:
+                if k == 0:
+                    recall_at_1fp = sensitivities[k]
+                else:
+                    # Linear interpolation
+                    fp_prev, fp_curr = fp_per_image[k-1], fp_per_image[k]
+                    s_prev, s_curr = sensitivities[k-1], sensitivities[k]
+                    t = (1.0 - fp_prev) / (fp_curr - fp_prev)
+                    recall_at_1fp = s_prev + t * (s_curr - s_prev)
+                break
+        else:
+            # Never reached 1 FP/image — all spots were matched
+            recall_at_1fp = sensitivities[-1] if sensitivities else 0.0
+
+        if matched_distances:
+            mean_loc_error = np.mean(matched_distances)
 
     model.train()
 
-    return image_auroc, pixel_auroc
+    return recall_at_1fp, mean_loc_error
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -138,7 +195,7 @@ def train_on_device(args):
 
     # Initialize results CSV
     csv_path = os.path.join(output_dir, 'results.csv')
-    csv_fields = ['epoch', 'avg_loss', 'lr', 'gamma', 'image_auroc', 'pixel_auroc']
+    csv_fields = ['epoch', 'avg_loss', 'lr', 'gamma', 'recall_at_1fp', 'mean_loc_error']
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
     csv_writer.writeheader()
@@ -259,13 +316,16 @@ def train_on_device(args):
         f.write(f"Eval interval:    {args.eval_interval}\n")
         f.write(f"Gamma schedule:   [{args.gamma_start}, {args.gamma_end}] (cosine)\n")
         f.write(f"Seed:             {args.seed}\n")
-        f.write(f"Device:           {device}\n")
+        f.write(f"Device:           {device}\n\n")
+        f.write(f"--- Evaluation ---\n")
+        f.write(f"Match tolerance:  15 px (Chebyshev)\n")
+        f.write(f"Spot threshold:   0.05\n")
         f.write(f"{'='*60}\n")
     print(f"Training log saved: {log_path}")
 
     num_batches = len(dataloader)
 
-    best_pixel_auroc = -1.0
+    best_recall = -1.0
     best_epoch = -1
 
     for epoch in range(args.epochs):
@@ -314,17 +374,18 @@ def train_on_device(args):
         print(f'\nEpoch [{epoch+1}/{args.epochs}] Summary - Avg Loss: {avg_loss:.4e} - Gamma: {current_gamma:.3f}', end='')
 
         # Evaluate on validation set every eval_interval epochs (and always on last epoch)
-        image_auroc, pixel_auroc = None, None
+        recall_at_1fp, mean_loc_error = None, None
         if (epoch + 1) % args.eval_interval == 0 or (epoch + 1) == args.epochs:
             valid_images_dir = os.path.join(args.data_root, 'valid', 'images')
             valid_labels_dir = os.path.join(args.data_root, 'valid', 'labels')
 
             if os.path.exists(valid_images_dir):
-                image_auroc, pixel_auroc = evaluate_model(
+                recall_at_1fp, mean_loc_error = evaluate_model(
                     model_seg, valid_images_dir, valid_labels_dir,
                     args.in_channels, patch_size, device
                 )
-                print(f' - Image AUROC: {image_auroc:.4f} - Pixel AUROC: {pixel_auroc:.4f}', end='')
+                loc_str = f'{mean_loc_error:.1f}px' if not np.isnan(mean_loc_error) else 'N/A'
+                print(f' - Recall@1FP: {recall_at_1fp:.4f} - Loc Error: {loc_str}', end='')
             else:
                 print(' - Validation data not found', end='')
         print()
@@ -335,8 +396,8 @@ def train_on_device(args):
             'avg_loss': f'{avg_loss:.6e}',
             'lr': f'{get_lr(optimizer):.6f}',
             'gamma': f'{current_gamma:.3f}',
-            'image_auroc': f'{image_auroc:.4f}' if image_auroc is not None else '',
-            'pixel_auroc': f'{pixel_auroc:.4f}' if pixel_auroc is not None else '',
+            'recall_at_1fp': f'{recall_at_1fp:.4f}' if recall_at_1fp is not None else '',
+            'mean_loc_error': f'{mean_loc_error:.2f}' if mean_loc_error is not None and not np.isnan(mean_loc_error) else '',
         })
         csv_file.flush()
 
@@ -348,22 +409,22 @@ def train_on_device(args):
             'in_channels': args.in_channels,
             'epoch': epoch,
             'seed': args.seed,
-            'image_auroc': image_auroc,
-            'pixel_auroc': pixel_auroc,
+            'recall_at_1fp': recall_at_1fp,
+            'mean_loc_error': mean_loc_error,
         }
 
         # Always save last model
         torch.save(checkpoint, os.path.join(weights_dir, 'last.pth'))
 
-        # Save best model (by pixel AUROC)
-        if pixel_auroc is not None and pixel_auroc > best_pixel_auroc:
-            best_pixel_auroc = pixel_auroc
+        # Save best model (by recall@1FP)
+        if recall_at_1fp is not None and recall_at_1fp > best_recall:
+            best_recall = recall_at_1fp
             best_epoch = epoch + 1
             torch.save(checkpoint, os.path.join(weights_dir, 'best.pth'))
-            print(f'  >> New best model saved (Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch})')
+            print(f'  >> New best model saved (Recall@1FP: {best_recall:.4f} @ epoch {best_epoch})')
 
     csv_file.close()
-    print(f'\nTraining complete. Best Pixel AUROC: {best_pixel_auroc:.4f} @ epoch {best_epoch}')
+    print(f'\nTraining complete. Best Recall@1FP: {best_recall:.4f} @ epoch {best_epoch}')
     print(f'Results saved to: {csv_path}')
 
 def main():
