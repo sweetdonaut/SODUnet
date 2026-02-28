@@ -310,8 +310,8 @@ def main():
                         help='Ending gamma value for focal loss (default: 3.0)')
     parser.add_argument('--eval_interval', type=int, default=10,
                         help='Evaluate every N epochs (default: 10)')
-    parser.add_argument('--model_file', type=str, default='model',
-                        help='Model module to import: model (v1), model_v2, model_v3, model_v4 (default: model)')
+    parser.add_argument('--model_file', type=str, default='model_v1',
+                        help='Model module: model_v1, model_v2, model_v3, model_v4 (default: model_v1)')
     parser.add_argument('--base_channels', type=int, default=64,
                         help='Base channel width for UNet encoder (default: 64)')
     parser.add_argument('--dropout', type=float, default=0.0,

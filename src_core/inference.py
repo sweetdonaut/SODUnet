@@ -354,8 +354,8 @@ def main():
                         help='Path to YOLO labels directory for GT (optional)')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU ID to use. Set to -1 for CPU (default: 0)')
-    parser.add_argument('--model_file', type=str, default='model',
-                        help='Model module: model, model_v2, model_v3, model_v4 (default: model)')
+    parser.add_argument('--model_file', type=str, default='model_v1',
+                        help='Model module: model_v1, model_v2, model_v3, model_v4 (default: model_v1)')
     parser.add_argument('--base_channels', type=int, default=64,
                         help='Base channel width (default: 64)')
     parser.add_argument('--csv_path', type=str, default=None,
