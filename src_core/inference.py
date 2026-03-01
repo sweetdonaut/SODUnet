@@ -383,34 +383,41 @@ def inference(args):
     dataset = InferenceDataset(images_dir=args.images_dir)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
-    all_scores = []
-    all_labels = []
+    all_scores = []   # image-level max heatmap score
+    all_labels = []    # image-level GT label (1=defect, 0=normal)
     pixel_aurocs = []
-    all_spots = []  # (filename, x, y, score) across all images
+    all_spots = []     # (filename, x, y, score) across all images
+
+    heatmap_dir = os.path.join(output_dir, 'heatmaps')
+    os.makedirs(heatmap_dir, exist_ok=True)
 
     for i, sample in enumerate(dataloader):
         image = sample['image'].squeeze().numpy()
         img_path = sample['image_path'][0]
+        img_filename = os.path.basename(img_path)
         h, w = image.shape[:2]
 
         heatmap, processed_image = sliding_window_inference(
             image, model, patch_size, in_channels, device
         )
-        print(f"\r  Processing [{i+1}/{len(dataloader)}] {os.path.basename(img_path)}", end='', flush=True)
+        print(f"\r  Processing [{i+1}/{len(dataloader)}] {img_filename}", end='', flush=True)
+
+        # Always record image score and extract spots
+        max_score = float(heatmap.max())
+        all_scores.append(max_score)
+
+        spots = extract_spots(heatmap, threshold=args.threshold)
+        for sx, sy, sc in spots:
+            all_spots.append((img_filename, sx, sy, sc))
 
         # Load GT mask if labels_dir provided
         gt_mask = None
         if args.labels_dir:
-            basename = os.path.splitext(os.path.basename(img_path))[0]
+            basename = os.path.splitext(img_filename)[0]
             label_path = os.path.join(args.labels_dir, basename + '.txt')
             gt_mask = yolo_label_to_mask(label_path, h, w)
-
-        if gt_mask is not None:
-            max_score = heatmap.max()
             gt_binary = gt_mask.astype(np.float32) / 255.0
-
             has_anomaly = 1.0 if np.sum(gt_binary) > 0 else 0.0
-            all_scores.append(max_score)
             all_labels.append(has_anomaly)
 
             # Per-image pixel AUROC (avoids OOM from accumulating all pixels)
@@ -418,28 +425,65 @@ def inference(args):
                 pa = roc_auc_score(gt_binary.flatten(), heatmap.flatten())
                 pixel_aurocs.append(pa)
 
-        # Extract spots for review efficiency
-        if args.csv_path:
-            img_filename = os.path.basename(img_path)
-            spots = extract_spots(heatmap, threshold=args.threshold)
-            for sx, sy, sc in spots:
-                all_spots.append((img_filename, sx, sy, sc))
+        # Save heatmap visualization
+        visualize_results(image, heatmap,
+                          os.path.join(heatmap_dir, img_filename),
+                          gt_mask=gt_mask)
 
     print()
 
-    if args.labels_dir and len(all_scores) > 0:
-        if len(np.unique(all_labels)) > 1:
-            image_auroc = roc_auc_score(all_labels, all_scores)
+    # Save spots CSV (always)
+    spots_csv_path = os.path.join(output_dir, 'spots.csv')
+    all_spots.sort(key=lambda s: s[3], reverse=True)
+    with open(spots_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['filename', 'x', 'y', 'score'])
+        for fn, sx, sy, sc in all_spots:
+            writer.writerow([fn, sx, sy, f'{sc:.6f}'])
+    print(f"Spots: {len(all_spots)} total -> {spots_csv_path}")
+
+    # Save image scores CSV (always)
+    scores_csv_path = os.path.join(output_dir, 'image_scores.csv')
+    dataset_paths = dataset.image_paths
+    with open(scores_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['filename', 'max_score', 'num_spots'])
+        for idx, score in enumerate(all_scores):
+            fn = os.path.basename(dataset_paths[idx])
+            n_spots = sum(1 for s in all_spots if s[0] == fn)
+            writer.writerow([fn, f'{score:.6f}', n_spots])
+    print(f"Image scores: {len(all_scores)} images -> {scores_csv_path}")
+
+    # AUROC calculation
+    # Image AUROC: from labels_dir (pixel masks) or csv_path (defect coordinates)
+    image_labels = None
+    if args.labels_dir and len(all_labels) > 0:
+        image_labels = all_labels
+    elif args.csv_path:
+        # Derive image labels from CSV: filename in CSV = defect, otherwise = normal
+        gt_defects_for_auroc = load_defect_csv(args.csv_path)
+        image_labels = []
+        for idx in range(len(all_scores)):
+            fn = os.path.basename(dataset.image_paths[idx])
+            image_labels.append(1.0 if fn in gt_defects_for_auroc else 0.0)
+
+    if image_labels is not None:
+        if len(np.unique(image_labels)) > 1:
+            image_auroc = roc_auc_score(image_labels, all_scores)
             print(f"\nImage-level AUROC: {image_auroc:.4f}")
         else:
             print("\nImage-level AUROC: Cannot calculate (only one class present)")
+    else:
+        print("\nNo labels_dir or csv_path provided — skipping Image AUROC")
 
-        if len(pixel_aurocs) > 0:
-            mean_pixel_auroc = np.mean(pixel_aurocs)
-            print(f"Pixel-level AUROC (mean per-image): {mean_pixel_auroc:.4f} "
-                  f"({len(pixel_aurocs)} images with defects)")
-        else:
-            print("Pixel-level AUROC: Cannot calculate (no images with both classes)")
+    if args.labels_dir and len(pixel_aurocs) > 0:
+        mean_pixel_auroc = np.mean(pixel_aurocs)
+        print(f"Pixel-level AUROC (mean per-image): {mean_pixel_auroc:.4f} "
+              f"({len(pixel_aurocs)} images with defects)")
+    elif args.labels_dir:
+        print("Pixel-level AUROC: Cannot calculate (no images with both classes)")
+    else:
+        print("Pixel-level AUROC: skipped (requires --labels_dir)")
 
     # Review efficiency and FROC analysis
     if args.csv_path:

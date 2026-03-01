@@ -62,13 +62,20 @@ class DefectDataset(Dataset):
     Dataset for defect segmentation training.
     Reads images + YOLO polygon labels, rasterizes masks on-the-fly.
     Cuts images into fixed-size patches via sliding window.
+
+    bg_ratio controls background patch sampling:
+      -1 (default): use all patches (original behavior)
+       0: defect patches only
+       N: N background patches per defect patch
     """
 
-    def __init__(self, images_dir, labels_dir, patch_size=128, in_channels=1):
+    def __init__(self, images_dir, labels_dir, patch_size=128, in_channels=1,
+                 bg_ratio=-1):
         self.images_dir = images_dir
         self.labels_dir = labels_dir
         self.patch_size = patch_size
         self.in_channels = in_channels
+        self.bg_ratio = bg_ratio
 
         # Collect image paths
         self.image_paths = sorted(
@@ -99,12 +106,56 @@ class DefectDataset(Dataset):
         self.patches_per_image = len(self.y_positions) * len(self.x_positions)
         self.total_patches = len(self.image_paths) * self.patches_per_image
 
-        print(f"Images: {len(self.image_paths)}, size: {self.img_h}x{self.img_w}")
-        print(f"Patch: {patch_size}x{patch_size}, "
-              f"Y:{len(self.y_positions)} X:{len(self.x_positions)}, "
-              f"total: {self.total_patches}")
+        # Biased sampling: classify patches as defect or background
+        self.samples = None  # None means use all patches
+        if bg_ratio >= 0:
+            self.defect_patches = []  # list of (img_idx, patch_idx)
+            self.bg_patches = []
+            for img_idx, img_path in enumerate(self.image_paths):
+                label_path = self._get_label_path(img_path)
+                centroids = yolo_label_to_centroids(label_path, self.img_h, self.img_w)
+                for patch_idx in range(self.patches_per_image):
+                    y_idx = patch_idx // len(self.x_positions)
+                    x_idx = patch_idx % len(self.x_positions)
+                    sy = self.y_positions[y_idx]
+                    sx = self.x_positions[x_idx]
+                    ey = sy + patch_size
+                    ex = sx + patch_size
+                    has_defect = any(sy <= cy < ey and sx <= cx < ex
+                                    for cx, cy in centroids)
+                    if has_defect:
+                        self.defect_patches.append((img_idx, patch_idx))
+                    else:
+                        self.bg_patches.append((img_idx, patch_idx))
+            self._build_sample_list()
+            print(f"Biased sampling: bg_ratio={bg_ratio}, "
+                  f"{len(self.defect_patches)} defect patches, "
+                  f"{len(self.bg_patches)} bg patches, "
+                  f"{len(self.samples)} samples/epoch")
+        else:
+            print(f"Images: {len(self.image_paths)}, size: {self.img_h}x{self.img_w}")
+            print(f"Patch: {patch_size}x{patch_size}, "
+                  f"Y:{len(self.y_positions)} X:{len(self.x_positions)}, "
+                  f"total: {self.total_patches}")
+
+    def _build_sample_list(self):
+        """Build sample list with biased defect/bg ratio."""
+        samples = list(self.defect_patches)
+        if self.bg_ratio > 0 and len(self.bg_patches) > 0:
+            n_bg = int(len(self.defect_patches) * self.bg_ratio)
+            n_bg = min(n_bg, len(self.bg_patches))
+            bg_idx = np.random.choice(len(self.bg_patches), n_bg, replace=False)
+            samples.extend(self.bg_patches[i] for i in bg_idx)
+        self.samples = samples
+
+    def resample(self):
+        """Re-randomize background patches for a new epoch. No-op if bg_ratio < 0."""
+        if self.bg_ratio >= 0:
+            self._build_sample_list()
 
     def __len__(self):
+        if self.samples is not None:
+            return len(self.samples)
         return self.total_patches
 
     def _get_label_path(self, img_path):
@@ -113,10 +164,15 @@ class DefectDataset(Dataset):
         return os.path.join(self.labels_dir, basename + ".txt")
 
     def __getitem__(self, idx):
-        img_idx = idx // self.patches_per_image
-        patch_idx = idx % self.patches_per_image
-        y_idx = patch_idx // len(self.x_positions)
-        x_idx = patch_idx % len(self.x_positions)
+        if self.samples is not None:
+            img_idx, patch_idx = self.samples[idx]
+            y_idx = patch_idx // len(self.x_positions)
+            x_idx = patch_idx % len(self.x_positions)
+        else:
+            img_idx = idx // self.patches_per_image
+            patch_idx = idx % self.patches_per_image
+            y_idx = patch_idx // len(self.x_positions)
+            x_idx = patch_idx % len(self.x_positions)
 
         img_path = self.image_paths[img_idx]
         sy = self.y_positions[y_idx]

@@ -1,6 +1,78 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from geomloss import SamplesLoss
+
+
+class WassersteinLoss(nn.Module):
+    """Wasserstein-2 distance between predicted heatmap and GT mask.
+
+    Treats both as 2D probability distributions and computes the
+    optimal transport cost via geomloss (Sinkhorn divergence).
+
+    Input:
+        pred: [B, 2, H, W] softmax output (channel 1 = defect probability)
+        target: [B, 1, H, W] binary mask
+    Output:
+        scalar loss (mean W2 over batch)
+    """
+
+    def __init__(self, blur=1.0, scaling=0.9):
+        super().__init__()
+        self.loss_fn = SamplesLoss(loss="sinkhorn", p=2, blur=blur, scaling=scaling)
+        self._grid_cache = {}
+
+    def _get_grid(self, H, W, device):
+        key = (H, W, device)
+        if key not in self._grid_cache:
+            y = torch.arange(H, dtype=torch.float32, device=device)
+            x = torch.arange(W, dtype=torch.float32, device=device)
+            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)  # [N, 2]
+            self._grid_cache[key] = grid
+        return self._grid_cache[key]
+
+    def forward(self, pred, target):
+        B, C, H, W = pred.shape
+        grid = self._get_grid(H, W, pred.device)  # [N, 2]
+
+        # Defect probability channel
+        pred_prob = pred[:, 1, :, :]  # [B, H, W]
+        target_flat = target.squeeze(1)  # [B, H, W]
+
+        diag = (H**2 + W**2) ** 0.5
+        total_loss = 0.0
+        for b in range(B):
+            p = pred_prob[b].reshape(-1)
+            q = target_flat[b].reshape(-1)
+
+            p_sum = p.sum()
+            q_sum = q.sum()
+
+            # Skip clean images entirely (no GT defect → no Wasserstein signal)
+            if q_sum < 1e-8:
+                continue
+
+            # Collapse penalty: GT has defect but pred is empty
+            if p_sum < 1e-8:
+                total_loss += 1.0
+                continue
+
+            # Normalize to probability distributions (sum=1)
+            p = p / p_sum
+            q = q / q_sum
+
+            # geomloss: [1, N] weights, [1, N, 2] positions
+            dist = self.loss_fn(
+                p.unsqueeze(0), grid.unsqueeze(0),
+                q.unsqueeze(0), grid.unsqueeze(0),
+            )
+            # dist ≈ (1/2) * W2^2, convert to W2
+            w2 = (2 * dist).sqrt()
+            # Normalize by grid diagonal so value ∈ [0, 1]
+            total_loss += w2 / diag
+
+        return total_loss / max(B, 1)
 
 
 class FocalLoss(nn.Module):
