@@ -151,16 +151,18 @@ outputs/<task_name>/
 
 Inference 支援三種模式, 依據提供的參數自動切換:
 
-| 模式 | labels_dir | csv_path | 輸出 |
-|------|-----------|----------|------|
-| **生產模式** | - | - | heatmaps + spots.csv + image_scores.csv |
-| **座標評估模式** | - | 提供 | 以上 + Image AUROC + FROC + Review Efficiency |
-| **Mask 評估模式** | 提供 | - | 以上 + Image AUROC + Pixel AUROC |
-| **完整模式** | 提供 | 提供 | 全部指標 |
+| 模式 | labels_dir | csv_path | save_heatmaps | 輸出 |
+|------|-----------|----------|---------------|------|
+| **生產模式** | - | - | - | spots.csv + image_scores.csv |
+| **座標評估模式** | - | 提供 | - | 以上 + Image AUROC + FROC + Review Efficiency |
+| **Mask 評估模式** | 提供 | - | - | 以上 + Image AUROC + Pixel AUROC |
+| **完整模式** | 提供 | 提供 | - | 全部指標 |
+
+> 加上 `--save_heatmaps` 可在任何模式下額外輸出每張影像的 heatmap 視覺化圖。
 
 ### 4.1 生產模式 (無 GT)
 
-只有影像, 無標註:
+只有影像, 無標註 — 最快模式 (~216 ms/image):
 
 ```bash
 cd src_core
@@ -170,6 +172,17 @@ uv run python inference.py \
   --model_path ../outputs/my_experiment/weights/best.pth \
   --model_file model_v3 \
   --images_dir /path/to/test/images
+```
+
+如需 heatmap 圖片:
+
+```bash
+uv run python inference.py \
+  --task_name production_run \
+  --model_path ../outputs/my_experiment/weights/best.pth \
+  --model_file model_v3 \
+  --images_dir /path/to/test/images \
+  --save_heatmaps
 ```
 
 ### 4.2 座標評估模式 (有 defect CSV, 無 pixel mask)
@@ -214,27 +227,29 @@ uv run python inference.py \
   --csv_path /path/to/test/test_defects.csv
 ```
 
-### 4.4 參數說明
+### 4.5 參數說明
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
 | `--task_name` | (必填) | 輸出目錄名稱 |
-| `--model_path` | auto | 模型權重路徑 |
+| `--model_path` | auto | 模型權重路徑 (預設 `../outputs/<task_name>/weights/best.pth`) |
 | `--model_file` | model_v1 | 需與訓練一致 |
 | `--base_channels` | 64 | 需與訓練一致 |
 | `--images_dir` | (必填) | 測試影像目錄 |
 | `--labels_dir` | (可選) | 標註目錄, 提供則計算 AUROC |
 | `--csv_path` | (可選) | defect CSV, 提供則產生 FROC + Review Efficiency |
 | `--threshold` | 0.1 | Heatmap 閾值 (spot 提取用) |
+| `--batch_size` | 32 | Patch 批次推論大小 (越大越快, 受 GPU VRAM 限制) |
+| `--save_heatmaps` | off | 加上此 flag 才會輸出 heatmap 視覺化圖 |
 
-### 4.5 輸出結構
+### 4.6 輸出結構
 
 ```
 outputs/<task_name>/
 ├── spots.csv                       # [必出] 所有偵測點位 (filename, x, y, score)
 ├── image_scores.csv                # [必出] 每張影像分數 (filename, max_score, num_spots)
-├── heatmaps/                       # [必出] 每張影像的 heatmap 視覺化
-│   ├── test_0000.png
+├── heatmaps/                       # [需 --save_heatmaps] 每張影像的 heatmap 視覺化
+│   ├── test_0000.png               #   (Image | GT Mask | Heatmap | Overlay)
 │   └── ...
 ├── froc_all.png                    # [需 csv_path] FROC 曲線
 ├── froc_dsnr_low.png               # [需 csv_path] FROC (DSNR < 3.5)
@@ -244,7 +259,7 @@ outputs/<task_name>/
 └── review_efficiency_dsnr_high.png
 ```
 
-### 4.6 輸出指標
+### 4.7 輸出指標
 
 終端輸出範例:
 ```
@@ -261,6 +276,19 @@ FROC Curve (All): Recall@1FP=0.9600    # 需 csv_path
 - **Recall@1FP**: 在平均每張影像 1 個 false positive 時的召回率 (需 CSV)
 - **Spots**: 總偵測點數 (越少表示 false positive 越少)
 - **image_scores.csv**: 可用來自行設定閾值判斷影像是否有缺陷
+
+### 4.8 推論效能參考
+
+測試環境: v3 model (30.8M params), 205 張 1536x1536 影像, patch_size=224, batch_size=32
+
+| 模式 | 總時間 | ms/image | 說明 |
+|------|--------|----------|------|
+| 生產模式 (無 labels) | ~44s | ~216 | 最快, 只產 CSV |
+| 生產模式 + save_heatmaps | ~67s | ~329 | 多 cv2 存圖 |
+| 完整模式 (labels + csv) | ~98s | ~477 | pixel AUROC 佔 53% |
+
+> **效能瓶頸**: 無 labels 時 93% 時間在 GPU inference; 有 labels 時 pixel AUROC (sklearn) 佔最多時間。
+> `--batch_size` 可根據 GPU VRAM 調整, 32 和 64 效果相同 (49 patches/image, 2 batches 即完成)。
 
 ---
 
@@ -281,14 +309,15 @@ uv run python trainer.py \
   --bs 16 --lr 0.001 --epochs 100 \
   --eval_interval 5 --seed 42
 
-# 測試
+# 測試 (完整模式 + heatmap 輸出)
 uv run python inference.py \
   --task_name quicktest_eval \
   --model_path ../outputs/quicktest/weights/best.pth \
   --model_file model_v3 \
   --images_dir ../synthetic_data/png/test/images \
   --labels_dir ../synthetic_data/png/test/labels \
-  --csv_path ../synthetic_data/png/test/test_defects.csv
+  --csv_path ../synthetic_data/png/test/test_defects.csv \
+  --save_heatmaps
 ```
 
 預期結果: Image AUROC > 0.95, Pixel AUROC > 0.99, R@1FP > 0.93

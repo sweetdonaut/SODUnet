@@ -58,7 +58,7 @@ def _interpolate_recall(fp_per_image, sensitivities, target_fp):
 
 
 def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, device,
-                   match_tol=15, spot_threshold=0.05):
+                   match_tol=15, spot_threshold=0.05, batch_size=32):
     """Evaluate model on validation set using FROC metrics + AUROC.
 
     Returns dict with recall_at_1fp, recall_at_5fp, mean_loc_error_1fp, mean_loc_error_5fp,
@@ -106,23 +106,32 @@ def evaluate_model(model, images_dir, labels_dir, in_channels, patch_size, devic
             if y_positions is None or x_positions is None:
                 continue
 
+            # Collect all patches for batched inference
+            patches = []
+            patch_coords = []
             for y in y_positions:
                 for x in x_positions:
                     patch = image[y:y+patch_size, x:x+patch_size].astype(np.float32)
-
                     if in_channels == 1:
-                        input_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float() / 255.0
+                        tensor = torch.from_numpy(patch).unsqueeze(0).float() / 255.0
                     else:
                         patch_3ch = np.stack([patch] * in_channels, axis=0)
-                        input_tensor = torch.from_numpy(patch_3ch).unsqueeze(0).float() / 255.0
-                    input_tensor = input_tensor.to(device)
+                        tensor = torch.from_numpy(patch_3ch).float() / 255.0
+                    patches.append(tensor)
+                    patch_coords.append((y, x))
 
-                    output = model(input_tensor)
-                    output_sm = torch.softmax(output, dim=1)
-                    patch_score = output_sm[:, 1, :, :].squeeze().cpu().numpy()
+            # Batched forward pass
+            all_scores = []
+            for bi in range(0, len(patches), batch_size):
+                batch_tensor = torch.stack(patches[bi:bi+batch_size]).to(device)
+                output = model(batch_tensor)
+                output_sm = torch.softmax(output, dim=1)
+                all_scores.append(output_sm[:, 1, :, :].cpu().numpy())
+            all_scores = np.concatenate(all_scores, axis=0)
 
-                    full_score_map[y:y+patch_size, x:x+patch_size] += patch_score
-                    count_map[y:y+patch_size, x:x+patch_size] += 1
+            for pi, (y, x) in enumerate(patch_coords):
+                full_score_map[y:y+patch_size, x:x+patch_size] += all_scores[pi]
+                count_map[y:y+patch_size, x:x+patch_size] += 1
 
             heatmap = full_score_map / np.maximum(count_map, 1)
             num_images += 1

@@ -10,7 +10,6 @@ import csv
 import importlib
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from dataloader import calculate_positions, yolo_label_to_mask
 
 
@@ -46,7 +45,8 @@ class InferenceDataset(Dataset):
         }
 
 
-def sliding_window_inference(image, model, patch_size, in_channels, device):
+def sliding_window_inference(image, model, patch_size, in_channels, device,
+                             batch_size=32):
     h, w = image.shape[:2]
 
     if h < patch_size or w < patch_size:
@@ -58,105 +58,104 @@ def sliding_window_inference(image, model, patch_size, in_channels, device):
     if y_positions is None or x_positions is None:
         raise ValueError(f"Image size ({h}x{w}) is too small for patch size ({patch_size}x{patch_size})")
 
-    output_heatmap = np.zeros((h, w), dtype=np.float32)
-    weight_map = np.zeros((h, w), dtype=np.float32)
-
+    # Collect all patches and their positions
+    patches = []
+    positions = []  # (y_idx, x_idx, y, x)
     for y_idx, y in enumerate(y_positions):
         for x_idx, x in enumerate(x_positions):
             patch = image[y:y+patch_size, x:x+patch_size]
-
             if in_channels == 1:
-                input_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float() / 255.0
+                tensor = torch.from_numpy(patch).unsqueeze(0).float() / 255.0
             else:
                 patch_ch = np.stack([patch] * in_channels, axis=0)
-                input_tensor = torch.from_numpy(patch_ch).unsqueeze(0).float() / 255.0
-            input_tensor = input_tensor.to(device)
+                tensor = torch.from_numpy(patch_ch).float() / 255.0
+            patches.append(tensor)
+            positions.append((y_idx, x_idx, y, x))
 
-            with torch.no_grad():
-                output = model(input_tensor)
-                output_sm = F.softmax(output, dim=1)
-                patch_heatmap = output_sm[:, 1, :, :].squeeze().cpu().numpy()
+    # Batched forward pass
+    all_heatmaps = []
+    with torch.no_grad():
+        for i in range(0, len(patches), batch_size):
+            batch = torch.stack(patches[i:i+batch_size]).to(device)
+            output = model(batch)
+            output_sm = F.softmax(output, dim=1)
+            all_heatmaps.append(output_sm[:, 1, :, :].cpu().numpy())
+    all_heatmaps = np.concatenate(all_heatmaps, axis=0)
 
-            if len(y_positions) > 1 or len(x_positions) > 1:
-                # Center-crop stitching: each patch only contributes its non-overlapping center
-                y_stride = y_positions[1] - y_positions[0] if len(y_positions) > 1 else patch_size
-                y_margin = (patch_size - y_stride) // 2
+    # Stitch heatmap
+    output_heatmap = np.zeros((h, w), dtype=np.float32)
+    weight_map = np.zeros((h, w), dtype=np.float32)
 
-                if y_idx == 0:
-                    y_start_crop, y_end_crop = 0, patch_size - y_margin
-                elif y_idx == len(y_positions) - 1:
-                    y_start_crop, y_end_crop = y_margin, patch_size
-                else:
-                    y_start_crop, y_end_crop = y_margin, patch_size - y_margin
+    for idx, (y_idx, x_idx, y, x) in enumerate(positions):
+        patch_heatmap = all_heatmaps[idx]
 
-                if len(x_positions) > 1:
-                    x_stride = x_positions[1] - x_positions[0]
-                    x_margin = (patch_size - x_stride) // 2
+        if len(y_positions) > 1 or len(x_positions) > 1:
+            # Center-crop stitching: each patch only contributes its non-overlapping center
+            y_stride = y_positions[1] - y_positions[0] if len(y_positions) > 1 else patch_size
+            y_margin = (patch_size - y_stride) // 2
 
-                    if x_idx == 0:
-                        x_start_crop, x_end_crop = 0, patch_size - x_margin
-                    elif x_idx == len(x_positions) - 1:
-                        x_start_crop, x_end_crop = x_margin, patch_size
-                    else:
-                        x_start_crop, x_end_crop = x_margin, patch_size - x_margin
-                else:
-                    x_start_crop, x_end_crop = 0, patch_size
-
-                patch_region = patch_heatmap[y_start_crop:y_end_crop, x_start_crop:x_end_crop]
-
-                oy_s, oy_e = y + y_start_crop, y + y_end_crop
-                ox_s, ox_e = x + x_start_crop, x + x_end_crop
-
-                output_heatmap[oy_s:oy_e, ox_s:ox_e] = patch_region
-                weight_map[oy_s:oy_e, ox_s:ox_e] = 1
+            if y_idx == 0:
+                y_start_crop, y_end_crop = 0, patch_size - y_margin
+            elif y_idx == len(y_positions) - 1:
+                y_start_crop, y_end_crop = y_margin, patch_size
             else:
-                output_heatmap[y:y+patch_size, x:x+patch_size] = patch_heatmap
-                weight_map[y:y+patch_size, x:x+patch_size] = 1
+                y_start_crop, y_end_crop = y_margin, patch_size - y_margin
+
+            if len(x_positions) > 1:
+                x_stride = x_positions[1] - x_positions[0]
+                x_margin = (patch_size - x_stride) // 2
+
+                if x_idx == 0:
+                    x_start_crop, x_end_crop = 0, patch_size - x_margin
+                elif x_idx == len(x_positions) - 1:
+                    x_start_crop, x_end_crop = x_margin, patch_size
+                else:
+                    x_start_crop, x_end_crop = x_margin, patch_size - x_margin
+            else:
+                x_start_crop, x_end_crop = 0, patch_size
+
+            patch_region = patch_heatmap[y_start_crop:y_end_crop, x_start_crop:x_end_crop]
+
+            oy_s, oy_e = y + y_start_crop, y + y_end_crop
+            ox_s, ox_e = x + x_start_crop, x + x_end_crop
+
+            output_heatmap[oy_s:oy_e, ox_s:ox_e] = patch_region
+            weight_map[oy_s:oy_e, ox_s:ox_e] = 1
+        else:
+            output_heatmap[y:y+patch_size, x:x+patch_size] = patch_heatmap
+            weight_map[y:y+patch_size, x:x+patch_size] = 1
 
     output_heatmap = output_heatmap / np.maximum(weight_map, 1)
     return output_heatmap, image
 
 
 def visualize_results(image, heatmap, output_path, gt_mask=None):
-    ncols = 3 if gt_mask is None else 4
-    fig = plt.figure(figsize=(4 * ncols, 4), dpi=200)
-    gs = gridspec.GridSpec(1, ncols, figure=fig)
+    """Save heatmap visualization using cv2 (fast) — Image | [GT] | Heatmap | Overlay."""
+    gray = image.astype(np.uint8)
+    h, w = gray.shape[:2]
 
-    ax1 = fig.add_subplot(gs[0])
-    ax1.imshow(image, cmap='gray', vmin=0, vmax=255)
-    ax1.set_title('Image')
-    ax1.axis('off')
+    # Image panel (gray → BGR)
+    panel_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    col = 1
-    if gt_mask is not None:
-        ax_gt = fig.add_subplot(gs[col])
-        ax_gt.imshow(gt_mask, cmap='gray', vmin=0, vmax=255)
-        ax_gt.set_title('GT Mask')
-        ax_gt.axis('off')
-        col += 1
-
-    ax_hm = fig.add_subplot(gs[col])
+    # Heatmap panel (hot colormap)
     h_min, h_max = heatmap.min(), heatmap.max()
     if h_max - h_min < 1e-8:
-        h_min, h_max = 0, 1
-    im = ax_hm.imshow(heatmap, cmap='hot', vmin=h_min, vmax=h_max)
-    ax_hm.set_title('Heatmap')
-    ax_hm.axis('off')
-    plt.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
-    col += 1
+        h_min, h_max = 0.0, 1.0
+    norm = ((heatmap - h_min) / (h_max - h_min) * 255).astype(np.uint8)
+    panel_hm = cv2.applyColorMap(norm, cv2.COLORMAP_HOT)
 
-    # Overlay: red prediction on gray image
-    pred_bin = (heatmap > 0.5).astype(np.uint8) * 255
-    overlay = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_GRAY2RGB)
-    overlay[pred_bin > 0] = [255, 0, 0]
-    ax_ov = fig.add_subplot(gs[col])
-    ax_ov.imshow(overlay)
-    ax_ov.set_title('Overlay')
-    ax_ov.axis('off')
+    # Overlay panel (red on gray)
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    pred_bin = heatmap > 0.5
+    overlay[pred_bin] = [0, 0, 255]  # BGR red
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    panels = [panel_img]
+    if gt_mask is not None:
+        panel_gt = cv2.cvtColor(gt_mask.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        panels.append(panel_gt)
+    panels.extend([panel_hm, overlay])
+
+    cv2.imwrite(output_path, np.hstack(panels))
 
 
 def extract_spots(heatmap, threshold=0.1):
@@ -389,7 +388,8 @@ def inference(args):
     all_spots = []     # (filename, x, y, score) across all images
 
     heatmap_dir = os.path.join(output_dir, 'heatmaps')
-    os.makedirs(heatmap_dir, exist_ok=True)
+    if args.save_heatmaps:
+        os.makedirs(heatmap_dir, exist_ok=True)
 
     for i, sample in enumerate(dataloader):
         image = sample['image'].squeeze().numpy()
@@ -398,7 +398,8 @@ def inference(args):
         h, w = image.shape[:2]
 
         heatmap, processed_image = sliding_window_inference(
-            image, model, patch_size, in_channels, device
+            image, model, patch_size, in_channels, device,
+            batch_size=args.batch_size
         )
         print(f"\r  Processing [{i+1}/{len(dataloader)}] {img_filename}", end='', flush=True)
 
@@ -425,10 +426,11 @@ def inference(args):
                 pa = roc_auc_score(gt_binary.flatten(), heatmap.flatten())
                 pixel_aurocs.append(pa)
 
-        # Save heatmap visualization
-        visualize_results(image, heatmap,
-                          os.path.join(heatmap_dir, img_filename),
-                          gt_mask=gt_mask)
+        # Save heatmap visualization (optional)
+        if args.save_heatmaps:
+            visualize_results(image, heatmap,
+                              os.path.join(heatmap_dir, img_filename),
+                              gt_mask=gt_mask)
 
     print()
 
@@ -541,6 +543,10 @@ def main():
                         help='Path to test_defects.csv for review efficiency analysis')
     parser.add_argument('--threshold', type=float, default=0.1,
                         help='Heatmap threshold for spot extraction (default: 0.1)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for patch inference (default: 32)')
+    parser.add_argument('--save_heatmaps', action='store_true',
+                        help='Save heatmap visualization images (slower)')
 
     args = parser.parse_args()
 
